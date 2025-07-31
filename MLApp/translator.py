@@ -1,7 +1,7 @@
 import pandas as pd
 from deep_translator import GoogleTranslator
 
-df = pd.read_csv("../enriched_courses_final.csv")
+df = pd.read_csv("../translated_dataset.csv")
 
 
 def translate_column(column, col_name):
