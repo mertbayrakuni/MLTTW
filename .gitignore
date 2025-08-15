@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Env
+.env
+*.env
+
+# Django
+db.sqlite3
+media/
+staticfiles/
+local_settings.py
+
+# Gradio cache
+gradio_cached_examples/
+gradio/
