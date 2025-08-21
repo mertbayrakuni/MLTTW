@@ -1,28 +1,50 @@
-# ui.py — kursbul.net Assistant (frontend-only)
 from __future__ import annotations
+
+import os
+import sys
+import json
+import time
+import asyncio
 from pathlib import Path
-import sys, os, time, json
 from typing import List, Tuple, Optional
+from urllib.parse import urlparse, urlunparse
 
 import gradio as gr
-import requests
+import websockets
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------------------
 # Make project root importable
+# ---------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-# Env + Logging
+# ---------------------------------------------------------------------
+# Logging (robust import with fallback)
+# ---------------------------------------------------------------------
 load_dotenv(PROJECT_ROOT / ".env")
-from MLApp.utils.logging_setup import setup_logging, get_logger, LOG_FILE
-setup_logging()
-log = get_logger("ui")
+try:
+    from MLApp.utils.logging_setup import setup_logging, get_logger, LOG_FILE  # type: ignore
+    setup_logging()
+    log = get_logger("ui")
+except Exception:
+    import logging
+    LOG_FILE = PROJECT_ROOT / "logs" / "app.log"
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger("ui")
 
-# ------------------------------- backend adapter -------------------------------
+# =====================================================================
+# Helpers
+# =====================================================================
 
 def _history_to_messages(history_tuples: List[Tuple[str, str]], system_prompt: str) -> list[dict]:
-    msgs = []
+    msgs: list[dict] = []
     if system_prompt and system_prompt.strip():
         msgs.append({"role": "system", "content": system_prompt.strip()})
     for user, bot in history_tuples:
@@ -32,47 +54,130 @@ def _history_to_messages(history_tuples: List[Tuple[str, str]], system_prompt: s
             msgs.append({"role": "assistant", "content": bot})
     return msgs
 
-def call_backend_chat(prompt: str,
-                      history_tuples: List[Tuple[str, str]],
-                      system_prompt: str) -> str:
+
+def _build_ws_url(base: str) -> str:
     """
-    POSTs to your backend. Adjust the path/field names to your API.
-    Expected JSON response with 'answer' or 'text'.
+    Accept many forms and normalize to a ws/wss URL.
+
+    Allowed inputs, e.g.:
+      https://<domain>           -> wss://<domain>/ws
+      http://<domain>            ->  ws://<domain>/ws
+      https://<domain>/ws        -> wss://<domain>/ws
+      https://<domain>/ws/chat   -> wss://<domain>/ws/chat
+      wss://<domain>             -> wss://<domain>/ws
+      wss://<domain>/ws          -> wss://<domain>/ws
+      wss://<domain>/ws/chat     -> wss://<domain>/ws/chat
     """
-    base = os.getenv("KURSBUL_API_BASE", "").rstrip("/")
+    base = (base or "").strip()
     if not base:
         raise RuntimeError("KURSBUL_API_BASE is not set")
 
-    url = f"{base}/chat"        # <- change if your route is different
+    if "://" not in base:  # bare host
+        base = "https://" + base
+
+    p = urlparse(base)
+
+    # scheme -> ws/wss
+    if p.scheme in ("http", "https"):
+        scheme = "wss" if p.scheme == "https" else "ws"
+    elif p.scheme in ("ws", "wss"):
+        scheme = p.scheme
+    else:
+        scheme = "wss"
+
+    # path normalization
+    path = p.path or ""
+    if not path or path == "/":
+        path = "/ws"
+    else:
+        if path.endswith("/ws"):
+            path = "/ws"
+        elif path.endswith("/ws/"):
+            path = "/ws"
+        elif path.endswith("/ws/chat"):
+            path = "/ws/chat"
+        else:
+            if path.endswith("/"):
+                path = path[:-1]
+            path = path + "/ws"
+
+    return urlunparse((scheme, p.netloc, path, "", p.query, ""))
+
+# =====================================================================
+# Backend adapter (WebSocket)
+# =====================================================================
+
+async def call_backend_ws(prompt: str,
+                          history_tuples: List[Tuple[str, str]],
+                          system_prompt: str) -> str:
+    base = os.getenv("KURSBUL_API_BASE", "")
+    url = _build_ws_url(base)
+
     payload = {
         "prompt": prompt,
         "messages": _history_to_messages(history_tuples, system_prompt),
-        # include whatever your backend expects:
-        # "top_k": 5, "mode": "chat", ...
     }
-    headers = {"Content-Type": "application/json"}
-    api_key = os.getenv("KURSBUL_API_KEY")
+
+    # Optional Authorization
+    headers: list[tuple[str, str]] = []
+    api_key = (os.getenv("KURSBUL_API_KEY") or "").strip()
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers.append(("Authorization", f"Bearer {api_key}"))
 
-    log.debug("POST %s", url)
-    r = requests.post(url, json=payload, headers=headers, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    answer = data.get("answer") or data.get("text") or data.get("message")
-    if not answer:
-        raise ValueError(f"Backend reply missing text: {data}")
-    return answer
+    log.info("Connecting WS %s", url)
+    parts: list[str] = []
+    connect_timeout = int(os.getenv("WS_CONNECT_TIMEOUT", "15"))
+    read_timeout = int(os.getenv("WS_READ_TIMEOUT", "60"))
 
-# ----------------------------- optional course search --------------------------
+    async with websockets.connect(url, extra_headers=headers, open_timeout=connect_timeout, ping_interval=None) as ws:
+        await ws.send(json.dumps(payload, ensure_ascii=False))
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=read_timeout)
+            except asyncio.TimeoutError:
+                log.warning("WS read timeout")
+                break
+            data = {}
+            try:
+                data = json.loads(msg)
+            except Exception:
+                parts.append(str(msg))  # some servers stream plain text
+                continue
 
-_COURSES = None
+            if "answer" in data:
+                parts.append(str(data["answer"]))
+            elif "text" in data:
+                parts.append(str(data["text"]))
+
+            if data.get("done") is True:
+                break
+
+    return "".join(parts).strip() or "(boş yanıt)"
+
+
+def call_backend_chat(prompt: str,
+                      history_tuples: List[Tuple[str, str]],
+                      system_prompt: str) -> str:
+    try:
+        return asyncio.run(call_backend_ws(prompt, history_tuples, system_prompt))
+    except Exception as e:
+        log.exception("WS call failed")
+        return f"❌ WebSocket hatası: {e}"
+
+# =====================================================================
+# Optional: local course search helpers
+# =====================================================================
+
+_COURSES_DF = None
+
 def load_courses_df():
-    """Loads a local CSV/XLSX if present. If none found, returns empty DF."""
-    global _COURSES
-    if _COURSES is not None:
-        return _COURSES
+    """Try to load any of a few local files; fallback to empty."""
+    global _COURSES_DF
+    if _COURSES_DF is not None:
+        return _COURSES_DF
+
     import pandas as pd
+
     candidates = [
         PROJECT_ROOT / "enriched_courses_final.csv",
         PROJECT_ROOT / "Online_Courses.csv",
@@ -81,36 +186,39 @@ def load_courses_df():
     ]
     for p in candidates:
         try:
-            if p.suffix.lower() == ".xlsx":
-                df = pd.read_excel(p)
-            else:
-                df = pd.read_csv(p)
-            if not df.empty:
-                _COURSES = df
+            if p.exists():
+                if p.suffix.lower() == ".xlsx":
+                    df = pd.read_excel(p)
+                else:
+                    df = pd.read_csv(p)
+                _COURSES_DF = df
                 log.info("Loaded course dataset: %s (%s rows)", p.name, len(df))
-                return _COURSES
+                return _COURSES_DF
         except Exception:
             continue
+
     import pandas as pd
-    _COURSES = pd.DataFrame()
-    return _COURSES
+    _COURSES_DF = pd.DataFrame()
+    return _COURSES_DF
+
 
 def search_courses(query: str,
                    max_price: Optional[float],
                    durations: List[str],
                    providers: List[str],
                    top_k: int = 8):
-    """
-    Simple local filter — replace with a real backend search if you prefer.
-    """
+    """Simple local filter — returns (markdown, dataframe)."""
     import pandas as pd
     df = load_courses_df()
     cards_md = "### Sonuçlar\n"
     if df.empty:
         examples = [
-            {"title":"Python for Everybody","provider":"Coursera","price":"Free","duration":"≈ 40 saat","url":"https://www.coursera.org/"},
-            {"title":"Modern React + Redux","provider":"Udemy","price":"₺","duration":"≈ 25 saat","url":"https://www.udemy.com/"},
-            {"title":"SQL Fundamentals","provider":"Codecademy","price":"Freemium","duration":"≈ 10 saat","url":"https://www.codecademy.com/"},
+            {"title": "Python for Everybody", "provider": "Coursera", "price": "Free", "duration": "≈ 40 saat",
+             "url": "https://www.coursera.org/"},
+            {"title": "Modern React + Redux", "provider": "Udemy", "price": "₺", "duration": "≈ 25 saat",
+             "url": "https://www.udemy.com/"},
+            {"title": "SQL Fundamentals", "provider": "Codecademy", "price": "Freemium", "duration": "≈ 10 saat",
+             "url": "https://www.codecademy.com/"},
         ]
         for e in examples:
             cards_md += f"- **{e['title']}** — {e['provider']} · {e['duration']} · {e['price']}  \n  {e['url']}\n"
@@ -118,13 +226,19 @@ def search_courses(query: str,
 
     work = df.copy()
     cols = {c.lower(): c for c in work.columns}
-    def col(name):
-        return cols.get(name, next((c for c in work.columns if name in c.lower()), None))
+
+    def col(name: str) -> Optional[str]:
+        if name in cols:
+            return cols[name]
+        for c in work.columns:
+            if name in c.lower():
+                return c
+        return None
 
     title_c = col("title") or col("name") or col("course")
-    prov_c  = col("provider") or col("platform")
+    prov_c = col("provider") or col("platform")
     price_c = col("price") or col("ucret") or col("cost")
-    dur_c   = col("duration") or col("süre") or col("length") or col("hafta")
+    dur_c = col("duration") or col("süre") or col("length") or col("hafta")
 
     if query and title_c:
         work = work[work[title_c].astype(str).str.contains(query, case=False, na=False)]
@@ -133,36 +247,39 @@ def search_courses(query: str,
     if max_price is not None and price_c:
         def _parse(v):
             try:
-                v = str(v).replace("₺","").replace("$","").replace(",","").strip()
+                v = str(v).replace("₺", "").replace("$", "").replace(",", "").strip()
                 return float(v)
             except Exception:
                 return None
         work["_price_num"] = work[price_c].map(_parse)
         work = work[(work["_price_num"].isna()) | (work["_price_num"] <= max_price)]
 
-    rank_cols = [c for c in work.columns if "rating" in c.lower() or "enroll" in c.lower()]
+    rank_cols = [c for c in work.columns if ("rating" in c.lower()) or ("enroll" in c.lower())]
     if rank_cols:
         work = work.sort_values(rank_cols[0], ascending=False)
     else:
-        work = work.sort_values(title_c, ascending=True)
+        if title_c:
+            work = work.sort_values(title_c, ascending=True)
 
     out = work.head(top_k)
-    cards_md = "### Sonuçlar\n"
     for _, row in out.iterrows():
         t = str(row.get(title_c, "İsimsiz Kurs"))
         pr = str(row.get(prov_c, ""))
         du = str(row.get(dur_c, ""))
         pc = str(row.get(price_c, ""))
-        url = str(next((row.get(c) for c in ["url","link","site","page","course_url"] if c in row.index), "")) or "#"
-        meta = " · ".join([x for x in [pr or None, du or None, pc or None] if x])
+        url = str(next((row.get(c) for c in ["url", "link", "site", "page", "course_url"] if c in row.index), "")) or "#"
+        meta_parts = [x for x in [pr or None, du or None, pc or None] if x]
+        meta = " · ".join(meta_parts)
         line = f"- **{t}**" + (f" — {meta}" if meta else "")
         cards_md += f"{line}  \n  {url}\n"
 
     keep = [c for c in [title_c, prov_c, dur_c, price_c, "url"] if c and c in out.columns]
-    small = out[keep].rename(columns={title_c:"title", prov_c:"provider", dur_c:"duration", price_c:"price"})
+    small = out[keep].rename(columns={title_c: "title", prov_c: "provider", dur_c: "duration", price_c: "price"}) if keep else out
     return cards_md, small.reset_index(drop=True)
 
-# ----------------------------- logs helper ------------------------------------
+# =====================================================================
+# Logs helper
+# =====================================================================
 
 def tail_log(n_lines: int = 200) -> str:
     try:
@@ -175,17 +292,18 @@ def tail_log(n_lines: int = 200) -> str:
     except Exception as e:
         return f"Cannot read log: {e}"
 
-# ----------------------------- chat wiring ------------------------------------
+# =====================================================================
+# Chat wiring
+# =====================================================================
 
 def respond(message: str,
-            chat_history: List[Tuple[str,str]],
+            chat_history: List[Tuple[str, str]],
             system_prompt: str,
             auto_search: bool,
             max_price: Optional[float],
             durations: List[str],
             providers: List[str]):
-
-    log.info("User: %s", message[:200])
+    log.info("User: %s", (message or "")[:200])
     chat_history = chat_history + [(message, "")]
     try:
         answer = call_backend_chat(message, chat_history[:-1], system_prompt)
@@ -204,10 +322,12 @@ def respond(message: str,
 
     return chat_history, results_md, results_df
 
+
 def clear_chat():
     return [], ""
 
-def export_chat(history: List[Tuple[str,str]]):
+
+def export_chat(history: List[Tuple[str, str]]):
     ts = time.strftime("%Y%m%d-%H%M%S")
     out_dir = PROJECT_ROOT / "logs" / "chats"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -218,7 +338,9 @@ def export_chat(history: List[Tuple[str,str]]):
     log.info("Saved chat export: %s", path)
     return f"Kaydedildi: {path}"
 
-# ----------------------------------- UI ---------------------------------------
+# =====================================================================
+# UI
+# =====================================================================
 
 def build_ui():
     theme = gr.themes.Soft(primary_hue="indigo", neutral_hue="slate")
@@ -241,9 +363,11 @@ def build_ui():
                         scale=6
                     )
                     send = gr.Button("Gönder", variant="primary", scale=1)
+
                 with gr.Row():
                     clear = gr.Button("Temizle")
                     export = gr.Button("Dışa Aktar")
+
                 with gr.Accordion("Gelişmiş", open=False):
                     system_prompt = gr.Textbox(
                         label="Sistem talimatı (opsiyonel)",
@@ -264,12 +388,12 @@ def build_ui():
                     with gr.Accordion("Filtreler", open=False):
                         max_price = gr.Number(value=None, label="Maks. Fiyat (₺) — boş: sınırsız")
                         durations = gr.CheckboxGroup(
-                            choices=["<5 saat","5–10 saat","10–20 saat","20–40 saat","40+ saat"],
+                            choices=["<5 saat", "5–10 saat", "10–20 saat", "20–40 saat", "40+ saat"],
                             value=["10–20 saat"],
                             label="Süre (tavsiye amaçlı)"
                         )
                         providers = gr.CheckboxGroup(
-                            choices=["Coursera","Udemy","edX","Codecademy","LinkedIn Learning"],
+                            choices=["Coursera", "Udemy", "edX", "Codecademy", "LinkedIn Learning"],
                             label="Platform"
                         )
                     results_md = gr.Markdown("")
@@ -277,7 +401,8 @@ def build_ui():
 
                 with gr.Tab("Logs"):
                     n_lines = gr.Slider(50, 2000, value=400, step=50, label="Son N satır")
-                    log_box = gr.Textbox(value=tail_log(400), lines=18, interactive=False, label="logs/app.log", show_copy_button=True)
+                    log_box = gr.Textbox(value=tail_log(400), lines=18, interactive=False, label=str(LOG_FILE),
+                                         show_copy_button=True)
                     refresh = gr.Button("Yenile")
                     refresh.click(lambda n: tail_log(int(n)), n_lines, log_box)
                     gr.Timer(2.0).tick(lambda n: tail_log(int(n)), n_lines, log_box)
@@ -287,8 +412,8 @@ def build_ui():
 
         # Wiring
         def _on_send(user_msg, history, sys_prompt, auto_s, price, dur, provs):
-            if not (user_msg and user_msg.strip()):
-                return gr.update(), history, results_md, results_df
+            if not (user_msg and str(user_msg).strip()):
+                return gr.update(), history, "", None
             new_history, md, df = respond(user_msg, history, sys_prompt, auto_s, price, dur, provs)
             return new_history, new_history, md, df
 
